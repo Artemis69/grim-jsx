@@ -11,10 +11,12 @@ import {
   createIIFE,
   is,
   escape,
+  trim,
+  get,
 } from "../utils";
 
 /**
- * @param {babel.NodePath<babel.types.JSXElement>} path
+ * @param {babel.NodePath<import('@babel/core').types.JSXElement>} path
  * @returns
  */
 function JSXElement(path) {
@@ -44,12 +46,12 @@ function JSXElement(path) {
 
   const root = node;
 
-  /** @type {babel.types.Identifier[]} */
+  /** @type {import('@babel/core').types.Identifier[]} */
   let current = [];
-  /** @type {null | babel.types.Identifier} */
+  /** @type {null | import('@babel/core').types.Identifier} */
   let type = firstElementChild;
 
-  /** @type {babel.types.ExpressionStatement[]} */
+  /** @type {import('@babel/core').types.ExpressionStatement[]} */
   const expressions = [];
 
   const template = createTemplateLiteralBuilder();
@@ -83,18 +85,18 @@ function JSXElement(path) {
     }
   };
 
-  /** @type {Record<string, babel.types.Identifier | babel.types.MemberExpression>} */
+  /** @type {Record<string, import('@babel/core').types.Identifier | import('@babel/core').types.MemberExpression>} */
   const pathsMap = {};
 
   /**
-   * @param {babel.types.Identifier | babel.types.MemberExpression} [expr]
+   * @param {import('@babel/core').types.Identifier | import('@babel/core').types.MemberExpression} [expr]
    */
   const generateNodeReference = (expr) => {
     /** @type {string} */
     const curr_path =
       current.length === 0 ? templateName.name : current.map((i) => i.name).join(".");
 
-    /** @type {(babel.types.Identifier | babel.types.MemberExpression)[]} */
+    /** @type {(import('@babel/core').types.Identifier | import('@babel/core').types.MemberExpression)[]} */
     let ph = [...current];
     let path_changed = false;
 
@@ -148,46 +150,11 @@ function JSXElement(path) {
    */
   const process = (node) => {
     if (t.isJSXText(node)) {
-      const { value } = node;
+      const trimmed = trim(node.value);
 
-      if (value.trim() === "") return;
+      if (trimmed === null) return;
 
-      const splitted = value.split("\n");
-
-      let text = "";
-
-      let i = 0;
-
-      while (i < splitted.length) {
-        const line = splitted[i];
-
-        let str = escape(line.trim());
-
-        /**
-         *  `     I am formatting` -> `I am formatting`
-         *  ` I am not`            -> ` I am not`
-         *  `I just retarded     ` -> `I just retarded`
-         *  `I am not `            -> `I am not `
-         */
-
-        if (line[0] === " " && line[1] !== " ") {
-          str = " " + str;
-        }
-
-        let len = line.length;
-
-        if (line[len - 1] === " " && line[len - 2] !== " ") {
-          str += " ";
-        }
-
-        if (str.trim() !== "") {
-          text += i > 1 ? " " + str : str;
-        }
-
-        i++;
-      }
-
-      template.push(text);
+      template.push(trimmed);
     } else if (t.isJSXExpressionContainer(node)) {
       const { expression } = node;
 
@@ -267,10 +234,7 @@ function JSXElement(path) {
                 t.expressionStatement(
                   t.assignmentExpression(
                     "=",
-                    t.memberExpression(
-                      generateNodeReference(),
-                      t.identifier("textContent")
-                    ),
+                    t.memberExpression(generateNodeReference(), t.identifier("textContent")),
                     expression
                   )
                 )
@@ -294,10 +258,7 @@ function JSXElement(path) {
 
                   template.push(` ${name}="`);
                   template.push(
-                    t.callExpression(spreadFunctionName, [
-                      expression,
-                      t.booleanLiteral(true),
-                    ])
+                    t.callExpression(spreadFunctionName, [expression, t.booleanLiteral(true)])
                   );
                   template.push(`"`);
                 } else {
@@ -305,6 +266,140 @@ function JSXElement(path) {
                 }
               } else if (t.isStringLiteral(expression)) {
                 template.push(insertAttrubute(name, expression.value));
+              } else if (t.isIdentifier(expression)) {
+                const binding = path.scope.getBinding(expression.name);
+
+                const write = () => {
+                  template.push(` ${name}="`);
+                  template.push(expression);
+                  template.push(`"`);
+                };
+
+                if (!binding) {
+                  write();
+                  continue;
+                }
+
+                const { node } = binding.path;
+
+                if (!t.isVariableDeclarator(node)) {
+                  write();
+                  continue;
+                }
+
+                if (binding.kind === "const") {
+                  if (t.isStringLiteral(node.init) && t.isIdentifier(node.id)) {
+                    template.push(` ${name}="${node.init.value}"`);
+                  } else {
+                    write();
+                  }
+                } else {
+                  write();
+                }
+              } else if (t.isMemberExpression(expression)) {
+                const inline = () => {
+                  const { object, property } = expression;
+
+                  if (!t.isIdentifier(object)) return;
+                  if (!t.isIdentifier(property)) return;
+
+                  const binding = path.scope.getBinding(object.name);
+
+                  if (!binding) return;
+
+                  /**
+                   * 'var' is appectable here because module exports get transformed to 'var'
+                   */
+                  if (binding.kind !== "var" && binding.kind !== "const") return;
+
+                  const { path: bindingPath } = binding;
+                  const { node: bindingNode } = bindingPath;
+
+                  if (!t.isVariableDeclarator(bindingNode)) return;
+
+                  const { init } = bindingNode;
+
+                  if (!t.isObjectExpression(init)) return;
+
+                  const { properties } = init;
+
+                  let valid = true;
+                  /** @type {null | string} */
+                  let content = null;
+
+                  const mark = () => {
+                    valid = false;
+                  };
+
+                  for (const prop of properties) {
+                    if (t.isObjectMethod(prop) || t.isSpreadElement(prop)) {
+                      mark();
+                      break;
+                    }
+                    if (prop.computed) {
+                      mark();
+                      break;
+                    }
+
+                    const { key, value } = prop;
+
+                    if (!(t.isStringLiteral(key) || t.isIdentifier(key))) {
+                      mark();
+                      break;
+                    }
+                    if (!(t.isStringLiteral(value) || t.isIdentifier(value))) {
+                      mark();
+                      break;
+                    }
+
+                    if (get(key) === get(property)) {
+                      if (t.isStringLiteral(value)) {
+                        content = value.value;
+                      } else {
+                        const binding = path.scope.getBinding(value.name);
+
+                        if (!binding) {
+                          mark();
+                          break;
+                        }
+
+                        /**
+                         * 'var' is also ok here because it also may be exported
+                         */
+                        if (binding.kind !== "var" && binding.kind !== "const") return;
+
+                        const { path: bindingPath } = binding;
+                        const { node: bindingNode } = bindingPath;
+
+                        if (!t.isVariableDeclarator(bindingNode)) {
+                          mark();
+                          break;
+                        }
+
+                        const { init } = bindingNode;
+
+                        if (!t.isStringLiteral(init)) {
+                          mark();
+                          break;
+                        }
+
+                        content = init.value;
+                      }
+                    }
+                  }
+
+                  if (valid && content) {
+                    template.push(` ${name}="${content}"`);
+
+                    return true;
+                  }
+                };
+
+                if (!inline()) {
+                  template.push(` ${name}="`);
+                  template.push(expression);
+                  template.push(`"`);
+                }
               } else if (t.isExpression(expression)) {
                 template.push(` ${name}="`);
                 template.push(expression);
@@ -397,7 +492,7 @@ function JSXElement(path) {
       const current_raw = template.template.quasis[0].value.raw;
       const { sharedNodes } = shared();
 
-      /** @type {babel.types.VariableDeclaration | null} */
+      /** @type {import('@babel/core').types.VariableDeclaration | null} */
       let decl = null;
 
       /**
@@ -424,10 +519,9 @@ function JSXElement(path) {
         throw path.scope.hub.buildError(node, `${node.type} in unsupported.`, Error);
       }
 
-      const call = t.callExpression(
-        t.memberExpression(object, t.identifier("cloneNode")),
-        [t.booleanLiteral(true)]
-      );
+      const call = t.callExpression(t.memberExpression(object, t.identifier("cloneNode")), [
+        t.booleanLiteral(true),
+      ]);
 
       if (expressions.length > 0) {
         path.replaceWith(
@@ -444,9 +538,7 @@ function JSXElement(path) {
       if (expressions.length > 0) {
         path.replaceWith(
           createIIFE(
-            t.variableDeclaration("let", [
-              t.variableDeclarator(templateName, templateCall),
-            ]),
+            t.variableDeclaration("let", [t.variableDeclarator(templateName, templateCall)]),
             ...expressions,
             t.returnStatement(templateName)
           )
